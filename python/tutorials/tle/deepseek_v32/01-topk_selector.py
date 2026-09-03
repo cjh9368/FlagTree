@@ -52,7 +52,7 @@ TLE_RADIX_FINAL_SEQ_LEN_THRESHOLD = 12288
 TLE_SMEM_BLOCK_SIZE = 1024
 TLE_SMEM_NUM_WARPS = TLE_SMEM_BLOCK_SIZE // 32
 TLE_SMEM_NUM_STAGES = 1
-TLE_SMEM_INPUT_SIZE = 2048
+TLE_SMEM_INPUT_SIZE = 4096
 TLE_SMEM_CLUSTER_SIZE = 8
 TOPK_OBSERVATION_STEPS = 5
 TOPK_KERNEL_OBSERVATION_STEPS = tl.constexpr(TOPK_OBSERVATION_STEPS)
@@ -1352,10 +1352,8 @@ def _tle_process_histogram_step_smem(
     s_threshold_bin_idx_ptr,
     s_final_bin_size_ptr,
     src_idx_ptr,
-    src_val_ptr,
     src_count_ptr,
     dst_idx_ptr,
-    dst_val_ptr,
     dst_count_ptr,
     s_need_fallback_ptr,
     assume_aligned,
@@ -1429,33 +1427,14 @@ def _tle_process_histogram_step_smem(
                     scope="cta",
                 )
     else:
+        # A 2-D gather reserves enough layout scratch to erase the SMEM saved by dropping values.
         src_count = tl.minimum(tl.load(src_count_ptr), SMEM_INPUT_SIZE)
-        src_vec_full = src_count // (BLOCK_SIZE * VEC)
-        vec_processed = src_vec_full * BLOCK_SIZE * VEC
-        src_tail_tiles = tl.cdiv(src_count - vec_processed, BLOCK_SIZE)
-
-        for t in tl.range(0, src_vec_full):
-            base = t * BLOCK_SIZE * VEC + lane * VEC
-            pos = base[:, None] + vec[None, :]
-            val_bits_vec = tl.load(src_val_ptr + pos)
-            x_vec = val_bits_vec.to(tl.float32, bitcast=True)
-            key = _convert_to_trt_uint32(x_vec)
-            if step_idx == 1:
-                digit = ((key >> 10) & RADIX11_MASK).to(tl.int32)
-            else:
-                digit = (key & RADIX10_MASK).to(tl.int32)
-            tl.atomic_add(
-                hist_base_ptr + digit,
-                ones_vec_2d,
-                sem="relaxed",
-                scope="cta",
-            )
-
-        for t in tl.range(0, src_tail_tiles):
-            pos = vec_processed + t * BLOCK_SIZE + lane
+        src_tiles = tl.cdiv(src_count, BLOCK_SIZE)
+        for t in tl.range(0, src_tiles):
+            pos = t * BLOCK_SIZE + lane
             valid = pos < src_count
-            val_bits = tl.load(src_val_ptr + pos, mask=valid, other=0)
-            x = val_bits.to(tl.float32, bitcast=True)
+            idx = tl.load(src_idx_ptr + pos, mask=valid, other=0)
+            x = tl.load(row_ptr + idx * stride_xn, mask=valid, other=float("-inf"))
             key = _convert_to_trt_uint32(x)
             if step_idx == 1:
                 digit = ((key >> 10) & RADIX11_MASK).to(tl.int32)
@@ -1568,7 +1547,6 @@ def _tle_process_histogram_step_smem(
                     )
                     keep_eq = take_eq_next & (dst_pos < SMEM_INPUT_SIZE)
                     tl.store(dst_idx_ptr + dst_pos, idx, mask=keep_eq)
-                    tl.store(dst_val_ptr + dst_pos, x_vec.to(tl.int32, bitcast=True), mask=keep_eq)
                     overflow_mask = take_eq_next & (dst_pos >= SMEM_INPUT_SIZE)
                     tl.atomic_or(
                         fallback_ptrs_vec_2d,
@@ -1629,7 +1607,6 @@ def _tle_process_histogram_step_smem(
                     )
                     keep_eq = take_eq_next & (dst_pos < SMEM_INPUT_SIZE)
                     tl.store(dst_idx_ptr + dst_pos, idx, mask=keep_eq)
-                    tl.store(dst_val_ptr + dst_pos, x.to(tl.int32, bitcast=True), mask=keep_eq)
                     overflow_mask = take_eq_next & (dst_pos >= SMEM_INPUT_SIZE)
                     tl.atomic_or(
                         fallback_ptrs,
@@ -1692,7 +1669,6 @@ def _tle_process_histogram_step_smem(
                     )
                     keep_eq = take_eq_next & (dst_pos < SMEM_INPUT_SIZE)
                     tl.store(dst_idx_ptr + dst_pos, idx, mask=keep_eq)
-                    tl.store(dst_val_ptr + dst_pos, x.to(tl.int32, bitcast=True), mask=keep_eq)
                     overflow_mask = take_eq_next & (dst_pos >= SMEM_INPUT_SIZE)
                     tl.atomic_or(
                         fallback_ptrs,
@@ -1703,96 +1679,12 @@ def _tle_process_histogram_step_smem(
                     )
     else:
         src_count = tl.minimum(tl.load(src_count_ptr), SMEM_INPUT_SIZE)
-        src_vec_full = src_count // (BLOCK_SIZE * VEC)
-        vec_processed = src_vec_full * BLOCK_SIZE * VEC
-        src_tail_tiles = tl.cdiv(src_count - vec_processed, BLOCK_SIZE)
-
-        for t in tl.range(0, src_vec_full):
-            base = t * BLOCK_SIZE * VEC + lane * VEC
-            pos = base[:, None] + vec[None, :]
-            idx = tl.load(src_idx_ptr + pos)
-            val_bits_vec = tl.load(src_val_ptr + pos)
-            x_vec = val_bits_vec.to(tl.float32, bitcast=True)
-            key = _convert_to_trt_uint32(x_vec)
-            if step_idx == 1:
-                digit = ((key >> 10) & RADIX11_MASK).to(tl.int32)
-            else:
-                digit = (key & RADIX10_MASK).to(tl.int32)
-
-            take_lt = digit < threshold_bin_idx
-            out_pos_lt = tl.atomic_add(
-                found_ptrs_vec_2d,
-                ones_vec_2d,
-                mask=take_lt,
-                sem="relaxed",
-                scope="cta",
-            )
-            tl.store(
-                s_out_indices_ptr + out_pos_lt,
-                idx.to(tl.int32),
-                mask=take_lt & (out_pos_lt < TOPK),
-            )
-
-            if step_idx == 2:
-                take_eq = digit == threshold_bin_idx
-                out_pos_eq = tl.atomic_add(
-                    found_ptrs_vec_2d,
-                    ones_vec_2d,
-                    mask=take_eq,
-                    sem="relaxed",
-                    scope="cta",
-                )
-                tl.store(
-                    s_out_indices_ptr + out_pos_eq,
-                    idx.to(tl.int32),
-                    mask=take_eq & (out_pos_eq < TOPK),
-                )
-            elif use_final:
-                take_eq_final = digit == threshold_bin_idx
-                final_pos = tl.atomic_add(
-                    final_cnt_ptrs_vec_2d,
-                    ones_vec_2d,
-                    mask=take_eq_final,
-                    sem="relaxed",
-                    scope="cta",
-                )
-                tl.store(
-                    hist_base_ptr + final_pos,
-                    idx.to(tl.int32),
-                    mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
-                )
-                tl.store(
-                    hist_base_ptr + (FINAL_SORT_ITEMS + final_pos),
-                    x_vec.to(tl.int32, bitcast=True),
-                    mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
-                )
-            elif step_idx < 2:
-                take_eq_next = digit == threshold_bin_idx
-                dst_pos = tl.atomic_add(
-                    dst_count_ptrs_vec_2d,
-                    ones_vec_2d,
-                    mask=take_eq_next,
-                    sem="relaxed",
-                    scope="cta",
-                )
-                keep_eq = take_eq_next & (dst_pos < SMEM_INPUT_SIZE)
-                tl.store(dst_idx_ptr + dst_pos, idx.to(tl.int32), mask=keep_eq)
-                tl.store(dst_val_ptr + dst_pos, val_bits_vec, mask=keep_eq)
-                overflow_mask = take_eq_next & (dst_pos >= SMEM_INPUT_SIZE)
-                tl.atomic_or(
-                    fallback_ptrs_vec_2d,
-                    ones_vec_2d,
-                    mask=overflow_mask,
-                    sem="relaxed",
-                    scope="cta",
-                )
-
-        for t in tl.range(0, src_tail_tiles):
-            pos = vec_processed + t * BLOCK_SIZE + lane
+        src_tiles = tl.cdiv(src_count, BLOCK_SIZE)
+        for t in tl.range(0, src_tiles):
+            pos = t * BLOCK_SIZE + lane
             valid = pos < src_count
             idx = tl.load(src_idx_ptr + pos, mask=valid, other=0)
-            val_bits = tl.load(src_val_ptr + pos, mask=valid, other=0)
-            x = val_bits.to(tl.float32, bitcast=True)
+            x = tl.load(row_ptr + idx * stride_xn, mask=valid, other=float("-inf"))
             key = _convert_to_trt_uint32(x)
             if step_idx == 1:
                 digit = ((key >> 10) & RADIX11_MASK).to(tl.int32)
@@ -1857,7 +1749,6 @@ def _tle_process_histogram_step_smem(
                 )
                 keep_eq = take_eq_next & (dst_pos < SMEM_INPUT_SIZE)
                 tl.store(dst_idx_ptr + dst_pos, idx.to(tl.int32), mask=keep_eq)
-                tl.store(dst_val_ptr + dst_pos, val_bits, mask=keep_eq)
                 overflow_mask = take_eq_next & (dst_pos >= SMEM_INPUT_SIZE)
                 tl.atomic_or(
                     fallback_ptrs,
@@ -1965,20 +1856,6 @@ def tle_topk_selector_kernel_smem(
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    s_input_val0 = tle.gpu.alloc(
-        [SMEM_INPUT_SIZE],
-        dtype=tl.int32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    s_input_val1 = tle.gpu.alloc(
-        [SMEM_INPUT_SIZE],
-        dtype=tl.int32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
     s_input_count0 = tle.gpu.alloc(
         [1],
         dtype=tl.int32,
@@ -2038,8 +1915,6 @@ def tle_topk_selector_kernel_smem(
 
     s_input_idx0_ptr = tle.gpu.local_ptr(s_input_idx0, (0, ))
     s_input_idx1_ptr = tle.gpu.local_ptr(s_input_idx1, (0, ))
-    s_input_val0_ptr = tle.gpu.local_ptr(s_input_val0, (0, ))
-    s_input_val1_ptr = tle.gpu.local_ptr(s_input_val1, (0, ))
     s_input_count0_ptr = tle.gpu.local_ptr(s_input_count0, (0, ))
     s_input_count1_ptr = tle.gpu.local_ptr(s_input_count1, (0, ))
     s_need_fallback_ptr = tle.gpu.local_ptr(s_need_fallback, (0, ))
@@ -2071,24 +1946,18 @@ def tle_topk_selector_kernel_smem(
             found_topk_values = tl.load(s_found_topk_values_ptr)
             if step_idx == 0:
                 src_idx_ptr = s_input_idx0_ptr
-                src_val_ptr = s_input_val0_ptr
                 src_count_ptr = s_input_count0_ptr
                 dst_idx_ptr = s_input_idx0_ptr
-                dst_val_ptr = s_input_val0_ptr
                 dst_count_ptr = s_input_count0_ptr
             elif step_idx == 1:
                 src_idx_ptr = s_input_idx0_ptr
-                src_val_ptr = s_input_val0_ptr
                 src_count_ptr = s_input_count0_ptr
                 dst_idx_ptr = s_input_idx1_ptr
-                dst_val_ptr = s_input_val1_ptr
                 dst_count_ptr = s_input_count1_ptr
             else:
                 src_idx_ptr = s_input_idx1_ptr
-                src_val_ptr = s_input_val1_ptr
                 src_count_ptr = s_input_count1_ptr
                 dst_idx_ptr = s_input_idx0_ptr
-                dst_val_ptr = s_input_val0_ptr
                 dst_count_ptr = s_input_count0_ptr
 
             continue_to_next_step, step_need_final_sort = _tle_process_histogram_step_smem(
@@ -2106,10 +1975,8 @@ def tle_topk_selector_kernel_smem(
                 s_threshold_bin_idx_ptr,
                 s_final_bin_size_ptr,
                 src_idx_ptr,
-                src_val_ptr,
                 src_count_ptr,
                 dst_idx_ptr,
-                dst_val_ptr,
                 dst_count_ptr,
                 s_need_fallback_ptr,
                 assume_aligned=assume_aligned,
