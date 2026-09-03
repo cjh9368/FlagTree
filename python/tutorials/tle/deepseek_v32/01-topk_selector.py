@@ -52,8 +52,10 @@ TLE_RADIX_FINAL_SEQ_LEN_THRESHOLD = 12288
 TLE_SMEM_BLOCK_SIZE = 1024
 TLE_SMEM_NUM_WARPS = TLE_SMEM_BLOCK_SIZE // 32
 TLE_SMEM_NUM_STAGES = 1
-TLE_SMEM_INPUT_SIZE = 4096
+TLE_SMEM_INPUT_SIZE = 2048
 TLE_SMEM_CLUSTER_SIZE = 8
+TOPK_OBSERVATION_STEPS = 5
+TOPK_KERNEL_OBSERVATION_STEPS = tl.constexpr(TOPK_OBSERVATION_STEPS)
 BLOCK_CLUSTER_MESH_8 = tle.device_mesh({"block_cluster": [("cluster_x", TLE_SMEM_CLUSTER_SIZE)]})
 
 # %%
@@ -659,6 +661,8 @@ def _tle_final_select_radix(
 def tle_topk_selector_kernel(
     x_ptr,
     out_ptr,
+    observation_buckets_ptr,
+    observation_fallback_ptr,
     starts_ptr,
     ends_ptr,
     stride_xm,
@@ -669,6 +673,7 @@ def tle_topk_selector_kernel(
     TOPK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     USE_RADIX_FINAL: tl.constexpr,
+    OBSERVE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     row_start = tl.load(starts_ptr + pid).to(tl.int32)
@@ -688,6 +693,10 @@ def tle_topk_selector_kernel(
         seq_len = tl.multiple_of(seq_len, BLOCK_SIZE)
 
     lane = tl.arange(0, BLOCK_SIZE)
+    if OBSERVE:
+        for observation_step in tl.static_range(TOPK_KERNEL_OBSERVATION_STEPS):
+            tl.store(observation_buckets_ptr + pid * TOPK_KERNEL_OBSERVATION_STEPS + observation_step, -1)
+        tl.store(observation_fallback_ptr + pid, 0)
     if row_len <= TOPK:
         chunks: tl.constexpr = (TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
         for chunk_idx in tl.range(0, chunks):
@@ -797,6 +806,11 @@ def tle_topk_selector_kernel(
                 BLOCK_SIZE=BLOCK_SIZE,
             )
             need_final_sort = need_final_sort | step_need_final_sort
+            if OBSERVE:
+                tl.store(
+                    observation_buckets_ptr + pid * TOPK_KERNEL_OBSERVATION_STEPS + step_idx,
+                    tl.load(s_final_bin_size_ptr),
+                )
 
     if need_final_sort:
         if USE_RADIX_FINAL:
@@ -857,6 +871,8 @@ def tle_topk_selector_kernel(
 def tle_tilelang_topk_selector_kernel(
     x_ptr,
     out_ptr,
+    observation_buckets_ptr,
+    observation_fallback_ptr,
     starts_ptr,
     ends_ptr,
     stride_xm,
@@ -867,6 +883,7 @@ def tle_tilelang_topk_selector_kernel(
     TOPK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     SMEM_INPUT_SIZE: tl.constexpr,
+    OBSERVE: tl.constexpr,
 ):
     # Port of the optional TileLang reference kernel:
     # - 8-bit radix on float16-hi8 for coarse filtering;
@@ -880,6 +897,10 @@ def tle_tilelang_topk_selector_kernel(
 
     lane = tl.arange(0, BLOCK_SIZE)
     row_len = row_end - row_start
+    if OBSERVE:
+        for observation_step in tl.static_range(TOPK_KERNEL_OBSERVATION_STEPS):
+            tl.store(observation_buckets_ptr + pid * TOPK_KERNEL_OBSERVATION_STEPS + observation_step, -1)
+        tl.store(observation_fallback_ptr + pid, 0)
 
     # Initialize output to -1 to avoid stale values on partial fills.
     init_chunks: tl.constexpr = (TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -956,6 +977,9 @@ def tle_tilelang_topk_selector_kernel(
     # threshold bin id: max bin with suffix[bin] > new_topk.
     thr_bin = tl.max(tl.where(suffix > new_topk, bins, 0), axis=0).to(tl.int32)
     tl.store(s_threshold_bin_id_ptr, thr_bin)
+    if OBSERVE:
+        threshold_bucket_size = tl.sum(tl.where(bins == thr_bin, counts, 0), axis=0)
+        tl.store(observation_buckets_ptr + pid * TOPK_KERNEL_OBSERVATION_STEPS, threshold_bucket_size)
 
     thr_bin = tl.load(s_threshold_bin_id_ptr)
     count_gt = tl.load(tle.gpu.local_ptr(s_histogram, (thr_bin + 1, )))
@@ -1043,6 +1067,12 @@ def tle_tilelang_topk_selector_kernel(
             tl.store(hist_last_ptr, 0)
             thr_bin = tl.max(tl.where(suffix > new_topk, bins, 0), axis=0).to(tl.int32)
             tl.store(s_threshold_bin_id_ptr, thr_bin)
+            if OBSERVE:
+                threshold_bucket_size = tl.sum(tl.where(bins == thr_bin, counts, 0), axis=0)
+                tl.store(
+                    observation_buckets_ptr + pid * TOPK_KERNEL_OBSERVATION_STEPS + round_idx + 1,
+                    threshold_bucket_size,
+                )
             thr_bin = tl.load(s_threshold_bin_id_ptr)
             count_gt = tl.load(tle.gpu.local_ptr(s_histogram, (thr_bin + 1, )))
             new_topk = new_topk - count_gt
@@ -1856,6 +1886,8 @@ def _tle_process_histogram_step_smem(
 def tle_topk_selector_kernel_smem(
     x_ptr,
     out_ptr,
+    observation_buckets_ptr,
+    observation_fallback_ptr,
     starts_ptr,
     ends_ptr,
     stride_xm,
@@ -1867,6 +1899,7 @@ def tle_topk_selector_kernel_smem(
     BLOCK_SIZE: tl.constexpr,
     SMEM_INPUT_SIZE: tl.constexpr,
     USE_RADIX_FINAL: tl.constexpr,
+    OBSERVE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     row_start = tl.load(starts_ptr + pid).to(tl.int32)
@@ -1886,6 +1919,10 @@ def tle_topk_selector_kernel_smem(
         seq_len = tl.multiple_of(seq_len, BLOCK_SIZE)
 
     lane = tl.arange(0, BLOCK_SIZE)
+    if OBSERVE:
+        for observation_step in tl.static_range(TOPK_KERNEL_OBSERVATION_STEPS):
+            tl.store(observation_buckets_ptr + pid * TOPK_KERNEL_OBSERVATION_STEPS + observation_step, -1)
+        tl.store(observation_fallback_ptr + pid, 0)
     if row_len <= TOPK:
         chunks: tl.constexpr = (TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
         for chunk_idx in tl.range(0, chunks):
@@ -2081,8 +2118,16 @@ def tle_topk_selector_kernel_smem(
                 SMEM_INPUT_SIZE=SMEM_INPUT_SIZE,
             )
             need_final_sort = need_final_sort | step_need_final_sort
+            if OBSERVE:
+                tl.store(
+                    observation_buckets_ptr + pid * TOPK_KERNEL_OBSERVATION_STEPS + step_idx,
+                    tl.load(s_final_bin_size_ptr),
+                )
 
-    if tl.load(s_need_fallback_ptr) != 0:
+    need_fallback = tl.load(s_need_fallback_ptr)
+    if OBSERVE:
+        tl.store(observation_fallback_ptr + pid, need_fallback != 0)
+    if need_fallback != 0:
         _tle_topk_smem_overflow_fallback_fullscan(
             row_ptr,
             out_row,
@@ -2598,6 +2643,8 @@ def _tle_process_histogram_step_cluster(
 def tle_topk_selector_kernel_smem_cluster(
     x_ptr,
     out_ptr,
+    observation_buckets_ptr,
+    observation_fallback_ptr,
     starts_ptr,
     ends_ptr,
     stride_xm,
@@ -2610,6 +2657,7 @@ def tle_topk_selector_kernel_smem_cluster(
     TOPK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     USE_RADIX_FINAL: tl.constexpr,
+    OBSERVE: tl.constexpr,
 ):
     cluster_pid = tl.program_id(0)
     cluster_rank = tle.shard_id(mesh, "cluster_x")
@@ -2632,6 +2680,10 @@ def tle_topk_selector_kernel_smem_cluster(
         seq_len = tl.multiple_of(seq_len, BLOCK_SIZE)
 
     lane = tl.arange(0, BLOCK_SIZE)
+    if OBSERVE and is_rank0:
+        for observation_step in tl.static_range(TOPK_KERNEL_OBSERVATION_STEPS):
+            tl.store(observation_buckets_ptr + pid * TOPK_KERNEL_OBSERVATION_STEPS + observation_step, -1)
+        tl.store(observation_fallback_ptr + pid, 0)
     if row_len <= TOPK:
         if is_rank0:
             chunks: tl.constexpr = (TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -2770,6 +2822,11 @@ def tle_topk_selector_kernel_smem_cluster(
                 BLOCK_SIZE=BLOCK_SIZE,
             )
             need_final_sort = need_final_sort | step_need_final_sort
+            if OBSERVE and is_rank0:
+                tl.store(
+                    observation_buckets_ptr + pid * TOPK_KERNEL_OBSERVATION_STEPS + step_idx,
+                    tl.load(s_final_bin_size_ptr),
+                )
 
     if is_rank0 and need_final_sort:
         if USE_RADIX_FINAL:
@@ -2829,6 +2886,8 @@ def triton_topk_selector_kernel(
     out_ptr,
     cand0_ptr,
     cand1_ptr,
+    observation_buckets_ptr,
+    observation_fallback_ptr,
     starts_ptr,
     ends_ptr,
     stride_xm,
@@ -2843,6 +2902,7 @@ def triton_topk_selector_kernel(
     TOPK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     RADIX_BITS: tl.constexpr,
+    OBSERVE: tl.constexpr,
 ):
     tl.static_assert(RADIX_BITS == 8, "triton_topk_selector_kernel currently expects 8-bit radix")
     pid = tl.program_id(0)
@@ -2863,6 +2923,10 @@ def triton_topk_selector_kernel(
         seq_len = tl.multiple_of(seq_len, BLOCK_SIZE)
 
     lane = tl.arange(0, BLOCK_SIZE)
+    if OBSERVE:
+        for observation_step in tl.static_range(TOPK_KERNEL_OBSERVATION_STEPS):
+            tl.store(observation_buckets_ptr + pid * TOPK_KERNEL_OBSERVATION_STEPS + observation_step, -1)
+        tl.store(observation_fallback_ptr + pid, 0)
     n_tiles = tl.cdiv(seq_len, BLOCK_SIZE)
     RADIX_SIZE: tl.constexpr = 1 << RADIX_BITS
     RADIX_MASK: tl.constexpr = RADIX_SIZE - 1
@@ -2882,6 +2946,9 @@ def triton_topk_selector_kernel(
     coarse_cond = coarse_cumsum_desc > topk_target
     coarse_threshold_bin = tl.max(tl.where(coarse_cond, bins, 0), axis=0).to(tl.int32)
     coarse_counts_gt = tl.max(tl.where(bins == (coarse_threshold_bin + 1), coarse_cumsum_desc, 0), axis=0)
+    if OBSERVE:
+        coarse_bucket_size = tl.sum(tl.where(bins == coarse_threshold_bin, coarse_counts, 0), axis=0)
+        tl.store(observation_buckets_ptr + pid * TOPK_KERNEL_OBSERVATION_STEPS, coarse_bucket_size)
     new_topk = topk_target - coarse_counts_gt
     write_count = 0
     cand_count0 = 0
@@ -2936,6 +3003,12 @@ def triton_topk_selector_kernel(
             cond = cumsum_desc > k_to_find
             threshold_bin = tl.max(tl.where(cond, bins, 0), axis=0).to(tl.int32)
             counts_gt = tl.max(tl.where(bins == (threshold_bin + 1), cumsum_desc, 0), axis=0)
+            if OBSERVE:
+                threshold_bucket_size = tl.sum(tl.where(bins == threshold_bin, counts, 0), axis=0)
+                tl.store(
+                    observation_buckets_ptr + pid * TOPK_KERNEL_OBSERVATION_STEPS + round_idx + 1,
+                    threshold_bucket_size,
+                )
             desired = desired | (threshold_bin.to(tl.uint32) << shift)
             desired_mask = desired_mask | (radix_mask_u32 << shift)
             new_topk = k_to_find - counts_gt
@@ -3005,7 +3078,7 @@ if _HAVE_TILELANG:
         return bits_uint
 
     @tilelang.jit(pass_configs=_TL_PASS_CONFIGS)
-    def _tilelang_topk_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
+    def _tilelang_topk_impl(topk, observe, in_dtype=T.float32, out_dtype=T.int32):
         batch = T.dynamic("batch")
         seq_len = T.dynamic("seq_len")
         RADIX_LOCAL = 1 << 8
@@ -3018,6 +3091,8 @@ if _HAVE_TILELANG:
             index: T.Tensor[(batch, topk), out_dtype],
             starts: T.Tensor[(batch), out_dtype],
             ends: T.Tensor[(batch), out_dtype],
+            observation_buckets: T.Tensor[(batch, TOPK_OBSERVATION_STEPS), out_dtype],
+            observation_fallback: T.Tensor[(batch), out_dtype],
         ):
             with T.Kernel(batch, threads=BLOCK_SIZE) as (bx):
                 tx = T.get_thread_binding()
@@ -3040,6 +3115,10 @@ if _HAVE_TILELANG:
                 l_new_topk = topk
                 l_start_idx = starts[bx]
                 l_end_idx = ends[bx]
+                if observe and tx == 0:
+                    for observation_step in T.serial(TOPK_OBSERVATION_STEPS):
+                        observation_buckets[bx, observation_step] = -1
+                    observation_fallback[bx] = 0
 
                 T.fill(s_histogram, 0)
                 T.fill(s_num_input[0], 0)
@@ -3066,6 +3145,10 @@ if _HAVE_TILELANG:
                         s_threshold_bin_id[0] = tx
                 T.sync_threads()
                 l_threshold_bin_id = s_threshold_bin_id[0]
+                if observe and tx == 0:
+                    observation_buckets[bx, 0] = (
+                        s_histogram[l_threshold_bin_id] - s_histogram[l_threshold_bin_id + 1]
+                    )
                 l_new_topk = l_new_topk - s_histogram[l_threshold_bin_id + 1]
                 T.sync_threads()
 
@@ -3122,6 +3205,10 @@ if _HAVE_TILELANG:
                     T.sync_threads()
 
                     l_threshold_bin_id = s_threshold_bin_id[0]
+                    if observe and tx == 0:
+                        observation_buckets[bx, round + 1] = (
+                            s_histogram[l_threshold_bin_id] - s_histogram[l_threshold_bin_id + 1]
+                        )
                     l_new_topk = l_new_topk - s_histogram[l_threshold_bin_id + 1]
                     T.sync_threads()
 
@@ -3149,21 +3236,61 @@ if _HAVE_TILELANG:
 
         return tl_topk_kernel
 
-    def tilelang_topk_selector(input, starts, ends, topk, out: Optional[torch.Tensor] = None):
+    def tilelang_topk_selector(
+        input,
+        starts,
+        ends,
+        topk,
+        out: Optional[torch.Tensor] = None,
+        observation=None,
+    ):
         batch, _ = input.shape
         if out is None:
             out = torch.zeros((batch, topk), dtype=torch.int32, device=input.device)
-        kernel = _TL_KERNEL_CACHE.get(topk)
+        observation_buckets, observation_fallback, observe = _topk_observation_args(observation, out, batch)
+        cache_key = (topk, observe)
+        kernel = _TL_KERNEL_CACHE.get(cache_key)
         if kernel is None:
-            kernel = _tilelang_topk_impl(topk)
-            _TL_KERNEL_CACHE[topk] = kernel
-        kernel(input, out, starts, ends)
+            kernel = _tilelang_topk_impl(topk, observe)
+            _TL_KERNEL_CACHE[cache_key] = kernel
+        kernel(input, out, starts, ends, observation_buckets, observation_fallback)
         return out
 
 
 # %%
 # Python wrappers
 # ---------------
+
+
+def make_topk_observation(batch: int, device) -> dict[str, torch.Tensor]:
+    """Allocate the common per-row observation buffers used by native selectors."""
+    return {
+        "bucket_sizes": torch.full(
+            (batch, TOPK_OBSERVATION_STEPS),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        ),
+        "fallback": torch.zeros(batch, dtype=torch.int32, device=device),
+    }
+
+
+def _topk_observation_args(observation, out, batch):
+    if observation is None:
+        return out, out, False
+
+    if not isinstance(observation, dict) or set(observation) != {"bucket_sizes", "fallback"}:
+        raise ValueError("observation must be created by make_topk_observation()")
+    buckets = observation["bucket_sizes"]
+    fallback = observation["fallback"]
+    expected_buckets = (batch, TOPK_OBSERVATION_STEPS)
+    if buckets.shape != expected_buckets or buckets.dtype != torch.int32 or buckets.device != out.device:
+        raise ValueError(f"observation['bucket_sizes'] must be int32 {expected_buckets} on {out.device}")
+    if fallback.shape != (batch, ) or fallback.dtype != torch.int32 or fallback.device != out.device:
+        raise ValueError(f"observation['fallback'] must be int32 ({batch},) on {out.device}")
+    if not buckets.is_contiguous() or not fallback.is_contiguous():
+        raise ValueError("observation tensors must be contiguous")
+    return buckets, fallback, True
 
 
 def _supports_tle_cluster_remote() -> bool:
@@ -3181,6 +3308,7 @@ def tle_topk_selector(
     block_size=1024,
     out: Optional[torch.Tensor] = None,
     use_radix_final: Optional[bool] = None,
+    observation=None,
 ):
     if x.dtype != torch.float32:
         x = x.float()
@@ -3190,12 +3318,15 @@ def tle_topk_selector(
     tle_block_size = TLE_FIXED_BLOCK_SIZE
     if use_radix_final is None:
         use_radix_final = seq_len >= TLE_RADIX_FINAL_SEQ_LEN_THRESHOLD
+    observation_buckets, observation_fallback, observe = _topk_observation_args(observation, out, batch)
 
     batch, seq_len = x.shape
     grid = (batch, )
     tle_topk_selector_kernel[grid](
         x,
         out,
+        observation_buckets,
+        observation_fallback,
         starts,
         ends,
         x.stride(0),
@@ -3206,6 +3337,7 @@ def tle_topk_selector(
         TOPK=topk,
         BLOCK_SIZE=tle_block_size,
         USE_RADIX_FINAL=use_radix_final,
+        OBSERVE=observe,
         num_warps=TLE_FIXED_NUM_WARPS,
         num_stages=TLE_FIXED_NUM_STAGES,
     )
@@ -3219,6 +3351,7 @@ def tle_topk_selector_1024threads(
     topk,
     out: Optional[torch.Tensor] = None,
     use_radix_final: Optional[bool] = None,
+    observation=None,
 ):
     if x.dtype != torch.float32:
         x = x.float()
@@ -3228,11 +3361,14 @@ def tle_topk_selector_1024threads(
     tle_block_size = 1024
     if use_radix_final is None:
         use_radix_final = seq_len >= TLE_RADIX_FINAL_SEQ_LEN_THRESHOLD
+    observation_buckets, observation_fallback, observe = _topk_observation_args(observation, out, batch)
 
     grid = (batch, )
     tle_topk_selector_kernel[grid](
         x,
         out,
+        observation_buckets,
+        observation_fallback,
         starts,
         ends,
         x.stride(0),
@@ -3243,6 +3379,7 @@ def tle_topk_selector_1024threads(
         TOPK=topk,
         BLOCK_SIZE=tle_block_size,
         USE_RADIX_FINAL=use_radix_final,
+        OBSERVE=observe,
         num_warps=tle_block_size // 32,
         num_stages=TLE_FIXED_NUM_STAGES,
     )
@@ -3257,6 +3394,7 @@ def tle_topk_selector_smem(
     block_size=1024,
     out: Optional[torch.Tensor] = None,
     use_radix_final: Optional[bool] = None,
+    observation=None,
 ):
     if x.dtype != torch.float32:
         x = x.float()
@@ -3266,11 +3404,14 @@ def tle_topk_selector_smem(
     tle_block_size = TLE_SMEM_BLOCK_SIZE
     if use_radix_final is None:
         use_radix_final = seq_len >= TLE_RADIX_FINAL_SEQ_LEN_THRESHOLD
+    observation_buckets, observation_fallback, observe = _topk_observation_args(observation, out, batch)
     grid = (batch, )
     try:
         tle_topk_selector_kernel_smem[grid](
             x,
             out,
+            observation_buckets,
+            observation_fallback,
             starts,
             ends,
             x.stride(0),
@@ -3282,6 +3423,7 @@ def tle_topk_selector_smem(
             BLOCK_SIZE=tle_block_size,
             SMEM_INPUT_SIZE=TLE_SMEM_INPUT_SIZE,
             USE_RADIX_FINAL=use_radix_final,
+            OBSERVE=observe,
             num_warps=TLE_SMEM_NUM_WARPS,
             num_stages=TLE_SMEM_NUM_STAGES,
         )
@@ -3298,6 +3440,7 @@ def tle_topk_selector_smem_cluster(
     block_size=1024,
     out: Optional[torch.Tensor] = None,
     use_radix_final: Optional[bool] = None,
+    observation=None,
 ):
     if not _supports_tle_cluster_remote():
         raise RuntimeError("TLE-Cluster requires CUDA SM90+")
@@ -3309,10 +3452,13 @@ def tle_topk_selector_smem_cluster(
     tle_block_size = TLE_SMEM_BLOCK_SIZE
     if use_radix_final is None:
         use_radix_final = seq_len >= TLE_RADIX_FINAL_SEQ_LEN_THRESHOLD
+    observation_buckets, observation_fallback, observe = _topk_observation_args(observation, out, batch)
     grid = (batch, )
     tle_topk_selector_kernel_smem_cluster[grid](
         x,
         out,
+        observation_buckets,
+        observation_fallback,
         starts,
         ends,
         x.stride(0),
@@ -3325,6 +3471,7 @@ def tle_topk_selector_smem_cluster(
         TOPK=topk,
         BLOCK_SIZE=tle_block_size,
         USE_RADIX_FINAL=use_radix_final,
+        OBSERVE=observe,
         num_ctas=1,
         num_warps=TLE_SMEM_NUM_WARPS,
         num_stages=TLE_SMEM_NUM_STAGES,
@@ -3338,6 +3485,7 @@ def tle_tilelang_topk_selector(
     ends: torch.Tensor,
     topk: int,
     out: Optional[torch.Tensor] = None,
+    observation=None,
 ) -> torch.Tensor:
     # TileLang-style selector ported to Triton+TLE (no TileLang dependency).
     if x.dtype != torch.float32:
@@ -3345,11 +3493,14 @@ def tle_tilelang_topk_selector(
     batch, seq_len = x.shape
     if out is None:
         out = torch.full((batch, topk), -1, dtype=torch.int32, device=x.device)
+    observation_buckets, observation_fallback, observe = _topk_observation_args(observation, out, batch)
 
     grid = (batch, )
     tle_tilelang_topk_selector_kernel[grid](
         x,
         out,
+        observation_buckets,
+        observation_fallback,
         starts,
         ends,
         x.stride(0),
@@ -3360,6 +3511,7 @@ def tle_tilelang_topk_selector(
         TOPK=topk,
         BLOCK_SIZE=1024,
         SMEM_INPUT_SIZE=TLE_SMEM_INPUT_SIZE,
+        OBSERVE=observe,
         num_warps=1024 // 32,
         num_stages=1,
     )
@@ -3375,6 +3527,7 @@ def triton_topk_selector(
     out: Optional[torch.Tensor] = None,
     cand0: Optional[torch.Tensor] = None,
     cand1: Optional[torch.Tensor] = None,
+    observation=None,
 ):
     if x.dtype != torch.float32:
         x = x.float()
@@ -3388,6 +3541,7 @@ def triton_topk_selector(
 
     assert cand0.shape == (batch, seq_len) and cand0.dtype == torch.int32 and cand0.is_cuda
     assert cand1.shape == (batch, seq_len) and cand1.dtype == torch.int32 and cand1.is_cuda
+    observation_buckets, observation_fallback, observe = _topk_observation_args(observation, out, batch)
 
     # Triton kernel uses kernel-specific tuning to avoid slow/unstable configs.
     kernel_num_warps = 4 if block_size >= 1024 else 8
@@ -3398,6 +3552,8 @@ def triton_topk_selector(
         out,
         cand0,
         cand1,
+        observation_buckets,
+        observation_fallback,
         starts,
         ends,
         x.stride(0),
@@ -3412,6 +3568,7 @@ def triton_topk_selector(
         TOPK=topk,
         BLOCK_SIZE=block_size,
         RADIX_BITS=8,
+        OBSERVE=observe,
         num_warps=kernel_num_warps,
         num_stages=1,
     )
@@ -3958,11 +4115,11 @@ def _recall(pred, ref):
 
 
 _BENCH_PROVIDERS = (["triton"] + ["trtllm-prefill"] + ["trtllm-prefill-1024threads"] + ["flashinfer-cuda"] +
-                    ["tle-trt"] + ["tle-trt-1024threads"] + ["tle-cluster"] + ["tle-tilelang"] +
+                    ["tle-trt"] + ["tle-smem"] + ["tle-trt-1024threads"] + ["tle-cluster"] + ["tle-tilelang"] +
                     (["tilelang"] if _HAVE_TILELANG else []))
-_BENCH_NAMES = (["Triton"] + ["TRTLLM-Prefill"] + ["TRTLLM-Prefill-1024T"] + ["FlashInfer"] + ["TLE-TRT"] +
+_BENCH_NAMES = (["Triton"] + ["TRTLLM-Prefill"] + ["TRTLLM-Prefill-1024T"] + ["FlashInfer"] + ["TLE-TRT"] + ["TLE-SMEM"] +
                 ["TLE-TRT-1024T"] + ["TLE-Cluster"] + ["TLE-TileLang"] + (["TileLang"] if _HAVE_TILELANG else []))
-_BENCH_STYLES = ([("red", "-")] + [("black", "-")] + [("brown", "-")] + [("gray", "-")] + [("orange", "-")] +
+_BENCH_STYLES = ([("red", "-")] + [("black", "-")] + [("brown", "-")] + [("gray", "-")] + [("orange", "-")] + [("purple", "-")] +
                  [("olive", "-")] + [("teal", "-")] + [("pink", "-")] + ([("blue", "-")] if _HAVE_TILELANG else []))
 _BENCH_XVALS = [
     (1, 131072, 2048),
@@ -3977,6 +4134,32 @@ _BENCH_XVALS = [
 ]
 _PERF_TOPK2048_XVALS = [(batch, seq_len, 2048) for batch in (1, 132, 4096) for seq_len in (2048, 4096, 16384, 65536)]
 _TILELANG_SKIP_SEQ_LEN_MIN = 262144
+_OBSERVABLE_PROVIDERS = {
+    "triton",
+    "tle-trt",
+    "tle-smem",
+    "tle-trt-1024threads",
+    "tle-cluster",
+    "tle-tilelang",
+    "tilelang",
+}
+
+
+def _print_topk_observation(provider, observation):
+    bucket_sizes = observation["bucket_sizes"].cpu()
+    fallback = observation["fallback"].cpu()
+    step_summaries = []
+    for step_idx in range(TOPK_OBSERVATION_STEPS):
+        values = bucket_sizes[:, step_idx]
+        values = values[values >= 0]
+        if values.numel() > 0:
+            step_summaries.append(
+                f"step{step_idx}=min:{int(values.min())}/mean:{values.float().mean():.1f}/max:{int(values.max())}"
+            )
+    fallback_rows = int((fallback != 0).sum())
+    total_rows = fallback.numel()
+    steps = " ".join(step_summaries) if step_summaries else "no-radix-steps"
+    print(f"[observe] provider={provider} {steps} fallback={fallback_rows}/{total_rows}")
 
 
 @triton.testing.perf_report(
@@ -3992,12 +4175,15 @@ _TILELANG_SKIP_SEQ_LEN_MIN = 262144
         plot_name="topk-selector",
         args={},
     ))
-def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
+def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep, disable_observations):
     torch.manual_seed(1)
     x = torch.randn(batch, seq_len, device=DEVICE, dtype=torch.float32)
     starts = torch.zeros(batch, dtype=torch.int32, device=DEVICE)
     ends = torch.full((batch, ), seq_len, dtype=torch.int32, device=DEVICE)
     quantiles = [0.5, 0.2, 0.8]
+    observation = None
+    if not disable_observations and provider in _OBSERVABLE_PROVIDERS:
+        observation = make_topk_observation(batch, x.device)
 
     if provider == "tle-trt":
         tle_out = torch.full((batch, topk), -1, dtype=torch.int32, device=x.device)
@@ -4010,6 +4196,21 @@ def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
                 topk,
                 block_size=block_size,
                 out=tle_out,
+                observation=observation,
+            )
+
+    elif provider == "tle-smem":
+        tle_out = torch.full((batch, topk), -1, dtype=torch.int32, device=x.device)
+
+        def run():
+            tle_topk_selector_smem(
+                x,
+                starts,
+                ends,
+                topk,
+                block_size=block_size,
+                out=tle_out,
+                observation=observation,
             )
 
     elif provider == "tle-trt-1024threads":
@@ -4022,6 +4223,7 @@ def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
                 ends,
                 topk,
                 out=tle_out,
+                observation=observation,
             )
 
     elif provider == "tle-cluster":
@@ -4039,6 +4241,7 @@ def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
                 topk,
                 block_size=block_size,
                 out=tle_smem_cluster_out,
+                observation=observation,
             )
 
     elif provider == "tle-tilelang":
@@ -4051,6 +4254,7 @@ def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
                 ends,
                 topk,
                 out=tle_tl_out,
+                observation=observation,
             )
 
     elif provider == "triton":
@@ -4068,6 +4272,7 @@ def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
                 out=triton_out,
                 cand0=triton_cand0,
                 cand1=triton_cand1,
+                observation=observation,
             )
 
     elif provider == "trtllm-decode":
@@ -4164,7 +4369,7 @@ def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
         tilelang_out = torch.zeros((batch, topk), dtype=torch.int32, device=x.device)
 
         def run():
-            tilelang_topk_selector(x, starts, ends, topk, out=tilelang_out)
+            tilelang_topk_selector(x, starts, ends, topk, out=tilelang_out, observation=observation)
 
     ms, min_ms, max_ms = triton.testing.do_bench(
         run,
@@ -4172,6 +4377,8 @@ def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
         warmup=warmup,
         rep=rep,
     )
+    if observation is not None:
+        _print_topk_observation(provider, observation)
     return ms, max_ms, min_ms
 
 
@@ -4301,7 +4508,7 @@ def _parse_providers(raw):
 
 
 def run_bench(block_size, warmup, rep, show_plots, providers=None, bench_x_vals=None, quick_bench=False,
-              max_seq_len=None, perf_topk2048_cases=False):
+              max_seq_len=None, perf_topk2048_cases=False, disable_observations=False):
     bench = benchmark.benchmarks
 
     x_vals = list(_PERF_TOPK2048_XVALS) if perf_topk2048_cases else list(_BENCH_XVALS)
@@ -4333,7 +4540,10 @@ def run_bench(block_size, warmup, rep, show_plots, providers=None, bench_x_vals=
     bench.line_vals = line_vals
     bench.line_names = line_names
     bench.styles = styles
-    print(f"[bench] providers={line_vals}, x_vals={x_vals}, warmup={warmup}, rep={rep}, block_size={block_size}")
+    print(
+        f"[bench] providers={line_vals}, x_vals={x_vals}, warmup={warmup}, rep={rep}, "
+        f"block_size={block_size}, observations={not disable_observations}"
+    )
 
     benchmark.run(
         print_data=True,
@@ -4341,6 +4551,7 @@ def run_bench(block_size, warmup, rep, show_plots, providers=None, bench_x_vals=
         block_size=block_size,
         warmup=warmup,
         rep=rep,
+        disable_observations=disable_observations,
     )
 
 
@@ -4361,12 +4572,17 @@ def main(argv=None):
     parser.add_argument("--skip_correctness", action="store_true", help="skip correctness check")
     parser.add_argument("--skip_bench", action="store_true", help="skip benchmark")
     parser.add_argument(
+        "--disable_observations",
+        action="store_true",
+        help="disable all bucket/fallback observation allocation, kernel stores, and reporting",
+    )
+    parser.add_argument(
         "--providers",
         type=str,
         default="",
         help=(
             "comma-separated providers for benchmark, e.g. "
-            "tle-trt,tle-trt-1024threads,tle-cluster,triton,trtllm-prefill,trtllm-prefill-1024threads,flashinfer-cuda"),
+            "tle-trt,tle-smem,tle-trt-1024threads,tle-cluster,triton,trtllm-prefill,trtllm-prefill-1024threads,flashinfer-cuda"),
     )
     parser.add_argument(
         "--bench_x_vals",
@@ -4416,6 +4632,7 @@ def main(argv=None):
             quick_bench=args.quick_bench,
             max_seq_len=args.max_seq_len,
             perf_topk2048_cases=args.perf_topk2048_cases,
+            disable_observations=args.disable_observations,
         )
 
 
